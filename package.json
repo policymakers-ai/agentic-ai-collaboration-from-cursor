@@ -1,0 +1,28 @@
+{
+  "name": "ai-agents-conversation",
+  "version": "1.0.0",
+  "description": "Node.js server with two AI agents conversation",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "openai"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@ai-sdk/openai": "^2.0.71",
+    "ai": "^5.0.98",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "openai": "^4.20.0",
+    "zod": "^4.1.12"
+  }
+}
+
+

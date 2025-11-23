@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agents Conversation Client</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 30px;
+        }
+
+        .input-section {
+            background: #f7f9fc;
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        input[type="text"], input[type="number"] {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+
+        input[type="text"]:focus, input[type="number"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .loading.active {
+            display: block;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .conversation-section {
+            display: none;
+            margin-top: 30px;
+        }
+
+        .conversation-section.active {
+            display: block;
+        }
+
+        .conversation-header {
+            background: #f7f9fc;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .conversation-header h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .conversation-id {
+            color: #666;
+            font-size: 0.9em;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            padding: 20px;
+            border-radius: 10px;
+            animation: fadeIn 0.5s;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.backend {
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+        }
+
+        .message.devops {
+            background: #f3e5f5;
+            border-left: 4px solid #9c27b0;
+        }
+
+        .message-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .agent-icon {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 10px;
+            font-size: 1.2em;
+        }
+
+        .backend .agent-icon {
+            background: #2196f3;
+            color: white;
+        }
+
+        .devops .agent-icon {
+            background: #9c27b0;
+            color: white;
+        }
+
+        .message-content {
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .turn-label {
+            display: inline-block;
+            background: rgba(0, 0, 0, 0.1);
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            margin-left: 10px;
+        }
+
+        .examples {
+            margin-top: 20px;
+            padding: 15px;
+            background: #fff3e0;
+            border-radius: 8px;
+            border-left: 4px solid #ff9800;
+        }
+
+        .examples h4 {
+            color: #f57c00;
+            margin-bottom: 10px;
+        }
+
+        .example-topic {
+            cursor: pointer;
+            padding: 8px;
+            margin: 5px 0;
+            background: white;
+            border-radius: 5px;
+            transition: background 0.2s;
+        }
+
+        .example-topic:hover {
+            background: #ffe0b2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI Agents Conversation</h1>
+            <p>Watch Backend and DevOps AI agents collaborate on technical topics</p>
+        </div>
+
+        <div class="content">
+            <div class="input-section">
+                <div class="form-group">
+                    <label for="topic">💡 Topic for Discussion</label>
+                    <input 
+                        type="text" 
+                        id="topic" 
+                        placeholder="e.g., Design a microservices architecture for an e-commerce platform"
+                        value="Design a scalable REST API for a task management application"
+                    >
+                </div>
+
+                <div class="form-group">
+                    <label for="turns">🔄 Number of Turns (1-10)</label>
+                    <input 
+                        type="number" 
+                        id="turns" 
+                        min="1" 
+                        max="10" 
+                        value="3"
+                    >
+                </div>
+
+                <button class="button" onclick="startConversation()">
+                    Start Conversation
+                </button>
+
+                <div class="examples">
+                    <h4>📋 Example Topics (click to use):</h4>
+                    <div class="example-topic" onclick="setTopic(this)">
+                        Design a microservices architecture for an e-commerce platform
+                    </div>
+                    <div class="example-topic" onclick="setTopic(this)">
+                        Implement a secure authentication system with JWT and refresh tokens
+                    </div>
+                    <div class="example-topic" onclick="setTopic(this)">
+                        Build a real-time chat application with presence indicators
+                    </div>
+                    <div class="example-topic" onclick="setTopic(this)">
+                        Optimize database performance for a social media platform
+                    </div>
+                    <div class="example-topic" onclick="setTopic(this)">
+                        Implement CI/CD pipeline with zero-downtime deployments
+                    </div>
+                </div>
+            </div>
+
+            <div class="loading">
+                <div class="spinner"></div>
+                <p>AI agents are thinking and conversing...</p>
+                <p style="color: #666; font-size: 0.9em; margin-top: 10px;">This may take 30-60 seconds</p>
+            </div>
+
+            <div class="conversation-section" id="conversationSection">
+                <div class="conversation-header">
+                    <h3 id="conversationTopic"></h3>
+                    <div class="conversation-id">
+                        Conversation ID: <span id="conversationId"></span>
+                    </div>
+                </div>
+                <div id="messages"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:3001';
+
+        function setTopic(element) {
+            document.getElementById('topic').value = element.textContent.trim();
+        }
+
+        async function startConversation() {
+            const topic = document.getElementById('topic').value.trim();
+            const turns = parseInt(document.getElementById('turns').value);
+
+            if (!topic) {
+                alert('Please enter a topic for discussion');
+                return;
+            }
+
+            if (turns < 1 || turns > 10) {
+                alert('Number of turns must be between 1 and 10');
+                return;
+            }
+
+            // Show loading, hide previous conversation
+            document.querySelector('.loading').classList.add('active');
+            document.getElementById('conversationSection').classList.remove('active');
+            document.querySelector('.button').disabled = true;
+
+            try {
+                const response = await fetch(`${API_BASE}/start-conversation`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ topic, turns }),
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const data = await response.json();
+                displayConversation(data);
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to start conversation. Make sure the server is running on port 3001.');
+            } finally {
+                document.querySelector('.loading').classList.remove('active');
+                document.querySelector('.button').disabled = false;
+            }
+        }
+
+        function displayConversation(data) {
+            document.getElementById('conversationTopic').textContent = data.topic;
+            document.getElementById('conversationId').textContent = data.conversationId;
+
+            const messagesContainer = document.getElementById('messages');
+            messagesContainer.innerHTML = '';
+
+            data.conversation.forEach(message => {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${message.agent}`;
+
+                const agentName = message.agent === 'backend' ? 'Backend Agent' : 'DevOps Agent';
+                const agentIcon = message.agent === 'backend' ? '💻' : '🔧';
+
+                messageDiv.innerHTML = `
+                    <div class="message-header">
+                        <div class="agent-icon">${agentIcon}</div>
+                        <span>${agentName}</span>
+                        <span class="turn-label">Turn ${message.turn}</span>
+                    </div>
+                    <div class="message-content">${message.message}</div>
+                `;
+
+                messagesContainer.appendChild(messageDiv);
+            });
+
+            document.getElementById('conversationSection').classList.add('active');
+            document.getElementById('conversationSection').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // Allow Enter key to start conversation
+        document.getElementById('topic').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                startConversation();
+            }
+        });
+    </script>
+</body>
+</html>
+
+
+
