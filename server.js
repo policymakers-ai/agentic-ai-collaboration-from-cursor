@@ -159,6 +159,8 @@ class Agent {
       
     } catch (error) {
       console.error(`❌ Error in agent '${this.name}':`, error.message);
+      console.error(`   Full error:`, error);
+      console.error(`   Stack:`, error.stack);
       this.complete();
     }
   }
