@@ -52,6 +52,20 @@
             font-size: 1rem;
         }
 
+        select {
+            padding: 0.5rem 1rem;
+            border: 1px solid #d1d5db;
+            border-radius: 0.375rem;
+            font-size: 1rem;
+            background: white;
+            cursor: pointer;
+            min-width: 250px;
+        }
+
+        select:hover {
+            border-color: #9ca3af;
+        }
+
         button {
             padding: 0.5rem 1.5rem;
             background: #2563eb;
@@ -205,7 +219,17 @@
             <h1>🤖 AI Software Builder</h1>
         </div>
         <div class="controls">
-            <input type="text" id="topic" placeholder="Describe your project (e.g., 'Build a todo app')" value="Build a simple REST API with Node.js">
+            <select id="promptTemplate" onchange="fillPromptFromTemplate()">
+                <option value="">Select the prompt</option>
+                <option value="Build a fullstack payment processing system">Build a fullstack payment processing system</option>
+                <option value="Build a Docker-only deployment of PostgreSQL">Build a Docker-only deployment of PostgreSQL</option>
+                <option value="Build a simple REST API with Node.js">Build a simple REST API with Node.js</option>
+                <option value="Build a React frontend with TypeScript">Build a React frontend with TypeScript</option>
+                <option value="Build a microservices architecture with Kubernetes">Build a microservices architecture with Kubernetes</option>
+                <option value="Build a complete e-commerce platform">Build a complete e-commerce platform</option>
+                <option value="Build a CI/CD pipeline with GitHub Actions">Build a CI/CD pipeline with GitHub Actions</option>
+            </select>
+            <input type="text" id="topic" placeholder="Describe your project (e.g., 'Build a todo app')" value="">
             <button onclick="startConversation()" id="startBtn">Start Building</button>
             <button onclick="stopConversation()" id="stopBtn">Stop</button>
             <button onclick="wipeWorkspace()" id="wipeBtn" class="secondary">Wipe Workspace</button>
@@ -363,6 +387,11 @@
                     addLog(data.agent, 'file', `Listed files in: ${data.directory}`);
                     break;
                     
+                case 'file:deleted':
+                    addLog(data.agent, 'file', `Deleted file: ${data.path}`);
+                    updateFileTree(data.path, 'remove');
+                    break;
+                    
                 case 'conversation:complete':
                     addLog('system', 'status', 'Conversation Completed');
                     document.getElementById('startBtn').disabled = false;
@@ -409,11 +438,20 @@
         const files = new Set();
         function updateFileTree(path, action) {
             if (action === 'add') files.add(path);
+            else if (action === 'remove') files.delete(path);
             
             const tree = document.getElementById('file-tree');
             tree.innerHTML = Array.from(files).sort().map(f => 
                 `<div class="file-item">📄 ${f}</div>`
             ).join('');
+        }
+
+        function fillPromptFromTemplate() {
+            const select = document.getElementById('promptTemplate');
+            const input = document.getElementById('topic');
+            if (select.value) {
+                input.value = select.value;
+            }
         }
 
         async function startConversation() {
@@ -492,6 +530,21 @@
                 wipeBtn.disabled = false;
             }
         }
+
+        // Initialize: sync dropdown with initial input value
+        (function() {
+            const input = document.getElementById('topic');
+            const select = document.getElementById('promptTemplate');
+            const initialValue = input.value;
+            
+            // Check if initial value matches any template option
+            for (let option of select.options) {
+                if (option.value === initialValue) {
+                    select.value = initialValue;
+                    break;
+                }
+            }
+        })();
     </script>
 </body>
 </html>

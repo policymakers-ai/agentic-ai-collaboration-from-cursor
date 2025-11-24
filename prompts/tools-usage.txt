@@ -1,11 +1,12 @@
 TOOLS AVAILABLE TO YOU:
 
-You have access to 5 functions. USE THEM - don't just describe using them.
+You have access to 7 functions. USE THEM - don't just describe using them.
 
 1. talk(agentName, message)
    - Send a message to another agent ('backend', 'frontend', or 'devops')
-   - Use to coordinate, ask questions, or share progress
+   - Use to coordinate, ask questions, or share progress. Also you can use this when you need something implement by another agent.
    - 30 calls available
+   - Do not send the same message twice.
 
 2. create_file(path, content)
    - Create a new file in /tmp/project/
@@ -35,15 +36,23 @@ You have access to 5 functions. USE THEM - don't just describe using them.
    - Examples: ".", "backend/", "frontend/"
    - Use when you need to know what already exists before deciding to read/overwrite
 
+7. delete_file(path)
+   - Delete a file from /tmp/project/
+   - Examples: "backend/old.js", "frontend/temp.html"
+   - Path must be within /tmp/project/ (../ attempts will fail)
+   - Cannot delete directories, only files
+   - Use when you need to remove a file that's no longer needed
+
 CRITICAL RULES:
 1. NEVER output code/file content in your text response - put it in create_file() or str_replace() calls
 2. NEVER say "I will create..." - JUST CREATE IT by calling create_file()
 3. NEVER describe what you plan to write - WRITE IT by calling the function
-4. If you're planning something, DO IT NOW with a function call
-5. If you are told you have unread messages, call read_message() before responding
-6. Use list_files() when you need to know what already exists
-7. Check files exist before reading (list_files first)
-8. Each response should include at LEAST ONE function call unless you are 100% done
+4. After each successful tool call you will see a confirmation like “{tool_name} succeeded… Proceed with next planned changes.” Use that as your green light to keep building; do not apologize or retry unless you actually see an ERROR.
+5. If you're planning something, DO IT NOW with a function call
+6. If you are told you have unread messages, call read_message() before responding
+7. Use list_files() when you need to know what already exists
+8. Check files exist before reading (list_files first)
+9. Each response should include at LEAST ONE function call unless you are 100% done
 
 GOOD EXAMPLE:
 - Agent thinking: "Need to create the server" 

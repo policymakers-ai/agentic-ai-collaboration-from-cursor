@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, unlinkSync, statSync } from 'fs';
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import OpenAI from 'openai';
@@ -174,6 +174,33 @@ class FileSystemTools {
     return getFiles(fullPath);
   }
 
+  deleteFile(agentName, filePath) {
+    const fullPath = this._validatePath(filePath);
+    
+    // Check lock
+    if (!this.lockManager.acquireLock(filePath, agentName)) {
+      const owner = this.lockManager.getLockOwner(filePath);
+      throw new Error(`File is locked by ${owner}`);
+    }
+
+    try {
+      if (!existsSync(fullPath)) {
+        throw new Error(`File not found: ${filePath}`);
+      }
+      
+      // Ensure it's a file, not a directory
+      const stats = statSync(fullPath);
+      if (stats.isDirectory()) {
+        throw new Error(`Cannot delete directory: ${filePath}. Use file path only.`);
+      }
+      
+      unlinkSync(fullPath);
+      return `Successfully deleted file: ${filePath}`;
+    } finally {
+      this.lockManager.releaseLock(filePath, agentName);
+    }
+  }
+
   wipeWorkspace() {
     if (existsSync(PROJECT_WORKSPACE)) {
       rmSync(PROJECT_WORKSPACE, { recursive: true, force: true });
@@ -333,11 +360,18 @@ class Agent {
     if (errorMessage.includes('File already exists')) {
       return 'The file you tried to create already exists. Use str_replace() to modify it, or use read_file() to check its current content first.';
     } else if (errorMessage.includes('File not found')) {
+      if (functionName === 'delete_file') {
+        return 'The file does not exist. Use list_files() to check what files exist before deleting.';
+      }
       return 'The file does not exist. Use create_file() to create it first, or use list_files() to check what files exist.';
     } else if (errorMessage.includes('locked by')) {
       return 'Another agent is currently modifying this file. Wait a moment and try again, or work on a different file.';
     } else if (errorMessage.includes('String not found')) {
       return 'The old_string you specified was not found in the file. Use read_file() to check the current file content.';
+    } else if (errorMessage.includes('Cannot delete directory')) {
+      return 'You tried to delete a directory. delete_file() only works on files. Use list_files() to see the file structure.';
+    } else if (errorMessage.includes('Access denied')) {
+      return 'The path you specified is outside the allowed workspace (/tmp/project). Use only paths within the project folder.';
     }
     return 'Check the error message and try a different approach.';
   }
@@ -398,8 +432,47 @@ class Agent {
   }
 
   _buildMessages() {
+    // Build agent-specific folder context
+    const agentFolderMap = {
+      'backend': 'backend',
+      'frontend': 'frontend',
+      'devops': 'devops'
+    };
+    
+    const agentFolder = agentFolderMap[this.name] || '';
+    let folderContext = '';
+    
+    if (agentFolder) {
+      try {
+        const folderFiles = fileTools.listFiles(agentFolder);
+        if (folderFiles.length > 0) {
+          const fileContents = [];
+          for (const relativePath of folderFiles) {
+            // Construct full path relative to workspace root
+            const fullPath = path.join(agentFolder, relativePath);
+            try {
+              const content = fileTools.readFile(fullPath);
+              fileContents.push(`=== ${fullPath} ===\n${content}\n`);
+            } catch (err) {
+              // Skip files that can't be read (might be locked or deleted)
+              continue;
+            }
+          }
+          
+          if (fileContents.length > 0) {
+            folderContext = `\n\nYOUR FOLDER FILES (${agentFolder}/):\n${fileContents.join('\n')}\n`;
+            folderContext += `\nNOTE: You can ONLY see files from your ${agentFolder}/ folder automatically. For other files, use read_file() to look them up.\n`;
+          }
+        }
+      } catch (error) {
+        // Folder doesn't exist yet or can't be accessed - that's fine
+      }
+    }
+    
+    const systemContent = this.systemPrompt + folderContext;
+    
     const messages = [
-      { role: 'system', content: this.systemPrompt },
+      { role: 'system', content: systemContent },
       ...this.conversationHistory
     ];
 
@@ -427,6 +500,10 @@ class Agent {
       delivery: 'immediate',
       timestamp: new Date().toISOString()
     });
+    if (message.autoRun) {
+      this.needsAnotherRun = true;
+      this._processQueue();
+    }
   }
 
   _readNextInboxMessage() {
@@ -608,6 +685,20 @@ class Agent {
           }
         },
         {
+          name: 'delete_file',
+          description: 'DELETE a file from the workspace. Path must be within /tmp/project. Cannot delete directories.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'File path to delete, e.g., "backend/server.js" or "frontend/index.html"'
+              }
+            },
+            required: ['path']
+          }
+        },
+        {
           name: 'create_file',
           description: 'CREATE a new file NOW. Put the complete file content in the content parameter. DO NOT describe it in text.',
           parameters: {
@@ -678,15 +769,7 @@ class Agent {
       ];
       
       const totalInteractions = this.conversationHistory.filter(m => m.role === 'user').length;
-      let functionCallMode;
-      
-      if (this.talkCallCount === 0) {
-        functionCallMode = { name: 'talk' };
-      } else if (totalInteractions < 3) {
-        functionCallMode = 'auto';
-      } else {
-        functionCallMode = 'auto';
-      }
+      let functionCallMode = 'auto';
       
       const result = await openaiClient.chat.completions.create({
         model: 'gpt-4-turbo-preview',
@@ -762,6 +845,18 @@ Try again with:
 
           if (functionName === 'talk') {
             await this.talk(functionArgs.agentName, functionArgs.message);
+            this.conversationHistory.push({
+              role: 'system',
+              content: `${functionName} succeeded and message to ${functionArgs.agentName} was sent. Proceed with next planned changes.`
+            });
+            this.messageBus.emit(`message:${this.name}`, {
+              from: 'system',
+              to: this.name,
+              content: 'Tool call completed. Continue building.',
+              autoRun: true,
+              deliverImmediately: true,
+              timestamp: new Date().toISOString()
+            });
           } else if (functionName === 'create_file') {
             const result = fileTools.createFile(this.name, functionArgs.path, functionArgs.content);
             console.log(`📝 ${this.name.toUpperCase()} created file: ${functionArgs.path}`);
@@ -795,6 +890,19 @@ Try again with:
               result,
               timestamp: new Date().toISOString()
             });
+
+            this.conversationHistory.push({
+              role: 'system',
+              content: `${functionName} succeeded and file ${functionArgs.path} is successfully created. Proceed with next planned changes.`
+            });
+            this.messageBus.emit(`message:${this.name}`, {
+              from: 'system',
+              to: this.name,
+              content: 'Tool call completed. Continue building.',
+              autoRun: true,
+              deliverImmediately: true,
+              timestamp: new Date().toISOString()
+            });
             
           } else if (functionName === 'read_file') {
             const content = fileTools.readFile(functionArgs.path);
@@ -818,6 +926,19 @@ Try again with:
               agent: this.name,
               tool: functionName,
               result: content.length > 200 ? `${content.slice(0, 200)}...` : content,
+              timestamp: new Date().toISOString()
+            });
+
+            this.conversationHistory.push({
+              role: 'system',
+              content: `${functionName} succeeded for file ${functionArgs.path}. Proceed with next planned changes.`
+            });
+            this.messageBus.emit(`message:${this.name}`, {
+              from: 'system',
+              to: this.name,
+              content: 'Tool call completed. Continue building.',
+              autoRun: true,
+              deliverImmediately: true,
               timestamp: new Date().toISOString()
             });
             
@@ -852,6 +973,19 @@ Try again with:
               result,
               timestamp: new Date().toISOString()
             });
+
+            this.conversationHistory.push({
+              role: 'system',
+              content: `${functionName} succeeded for file ${functionArgs.path}. Proceed with next planned changes.`
+            });
+            this.messageBus.emit(`message:${this.name}`, {
+              from: 'system',
+              to: this.name,
+              content: 'Tool call completed. Continue building.',
+              autoRun: true,
+              deliverImmediately: true,
+              timestamp: new Date().toISOString()
+            });
             
           } else if (functionName === 'list_files') {
             const files = fileTools.listFiles(functionArgs.directory || '.');
@@ -878,6 +1012,56 @@ Try again with:
               result: `Found ${files.length} file(s)`,
               timestamp: new Date().toISOString()
             });
+
+            this.conversationHistory.push({
+              role: 'system',
+              content: `${functionName} succeeded for directory ${functionArgs.directory || '.'}. Proceed with next planned changes.`
+            });
+            this.messageBus.emit(`message:${this.name}`, {
+              from: 'system',
+              to: this.name,
+              content: 'Tool call completed. Continue building.',
+              autoRun: true,
+              deliverImmediately: true,
+              timestamp: new Date().toISOString()
+            });
+          } else if (functionName === 'delete_file') {
+            const result = fileTools.deleteFile(this.name, functionArgs.path);
+            console.log(`🗑️ ${this.name.toUpperCase()} deleted file: ${functionArgs.path}`);
+            
+            this.conversationHistory.push({
+              role: 'function',
+              name: functionName,
+              content: result
+            });
+            
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'file:deleted',
+              agent: this.name,
+              path: functionArgs.path,
+              timestamp: new Date().toISOString()
+            });
+
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'tool:result',
+              agent: this.name,
+              tool: functionName,
+              result,
+              timestamp: new Date().toISOString()
+            });
+
+            this.conversationHistory.push({
+              role: 'system',
+              content: `${functionName} succeeded and file ${functionArgs.path} is successfully deleted. Proceed with next planned changes.`
+            });
+            this.messageBus.emit(`message:${this.name}`, {
+              from: 'system',
+              to: this.name,
+              content: 'Tool call completed. Continue building.',
+              autoRun: true,
+              deliverImmediately: true,
+              timestamp: new Date().toISOString()
+            });
           } else if (functionName === 'read_message') {
             const delivery = this._readNextInboxMessage();
             this.conversationHistory.push({
@@ -888,6 +1072,18 @@ Try again with:
 
             if (delivery.messageRead) {
               this.needsAnotherRun = true;
+              this.conversationHistory.push({
+                role: 'system',
+                content: `${functionName} succeeded. ${this.inbox.length} message(s) left. Proceed with next planned changes.`
+              });
+              this.messageBus.emit(`message:${this.name}`, {
+                from: 'system',
+                to: this.name,
+                content: 'Tool call completed. Continue building.',
+                autoRun: true,
+                deliverImmediately: true,
+                timestamp: new Date().toISOString()
+              });
             }
           }
           
@@ -931,7 +1127,7 @@ Try again with:
                 to: this.name,
                 content: `You just provided a text response without calling any function. To make progress:
 
-- If you're DONE with all your work: Respond with text only again and you'll be marked complete.
+- If you're DONE with all your work and you notified your peers: Respond with text only again and you'll be marked complete.
 - If you have MORE work to do: Use create_file(), read_file(), list_files(), or str_replace() to actually implement what you just described.
 - If you're waiting for info: Use read_file() or list_files() to discover it yourself, or use talk() to ask and KEEP WORKING simultaneously.
 
@@ -1149,7 +1345,7 @@ Remember: Your goal is to deliver a COMPLETE implementation, not a partial one. 
     setTimeout(() => {
       const initialMsg = {
         from: 'system',
-        content: `Let's discuss: ${topic}. Please analyze this request from your domain perspective (Backend, Frontend, or DevOps). Use the talk function to coordinate with other agents as needed.`,
+        content: `User request: ${topic}. Please analyze this request from your domain perspective (Backend, Frontend, or DevOps). Use the talk function to coordinate with other agents as needed. In case this request is not relevant to you and you cannot anyhow contribute - you can complete immediately without talking.`,
         timestamp: new Date().toISOString()
       };
       
