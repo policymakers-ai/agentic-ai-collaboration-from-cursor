@@ -1,0 +1,53 @@
+TOOLS AVAILABLE TO YOU:
+
+You have access to 5 functions to interact with the workspace and other agents:
+
+1. talk(agentName, message)
+   - Send a message to another agent ('backend', 'frontend', or 'devops')
+   - Use this to coordinate, ask questions, or share progress
+   - You have 30 calls available
+   - IMPORTANT: You can ask a question AND continue working - don't wait idle for responses
+
+2. create_file(path, content)
+   - Create a new file in /tmp/project/
+   - Path examples: "backend/server.js", "frontend/src/App.jsx", "Dockerfile"
+   - BEFORE creating: Check if the file already exists using list_files() or read_file()
+   - If file exists and you want to modify it, use str_replace() instead
+   - Content should be complete, working code - not pseudocode or placeholders
+
+3. read_file(path)
+   - Read the content of any file in /tmp/project/
+   - Use this to check what other agents have created
+   - Use this to avoid asking questions - discover the answer yourself!
+   - Examples: read "backend/package.json" to see dependencies, read "backend/server.js" to see API endpoints
+
+4. str_replace(path, old_string, new_string)
+   - Modify an existing file by replacing text
+   - old_string must match EXACTLY (including whitespace)
+   - Use this to update/enhance files created by you or other agents
+   - Example: Add a new route to an existing server.js file
+
+5. list_files(directory)
+   - List all files in a directory
+   - Directory examples: ".", "backend/", "frontend/src/"
+   - Use this to explore what exists before creating files
+   - Use this to check if other agents have created files you need
+
+CRITICAL WORKFLOW:
+1. USE list_files() first to see what exists
+2. USE read_file() to check other agents' work instead of asking
+3. USE create_file() to build new files (check if exists first!)
+4. USE str_replace() to modify existing files
+5. USE talk() sparingly to coordinate when you truly need input
+
+ABSOLUTELY DO NOT:
+- Describe or mention calling these functions in your text response ("I will create...", "Let me create...", "I'll use create_file...")
+- Plan to use them - ACTUALLY USE THEM BY CALLING THE FUNCTION
+- Create the same file multiple times - check if it exists first with list_files()
+- Write pseudocode or incomplete implementations
+- Wait idle for responses - keep working with assumptions
+- Respond with ONLY text and no function call unless you are 100% done with ALL work
+
+EVERY RESPONSE MUST INCLUDE A FUNCTION CALL UNLESS YOU ARE COMPLETELY DONE.
+If you're planning to do something, DO IT NOW with a function call, don't just describe it.
+

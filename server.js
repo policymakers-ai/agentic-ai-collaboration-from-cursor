@@ -93,6 +93,11 @@ class FileSystemTools {
   createFile(agentName, filePath, content) {
     const fullPath = this._validatePath(filePath);
     
+    // Check if file already exists
+    if (existsSync(fullPath)) {
+      throw new Error(`File already exists: ${filePath}. Use str_replace() to modify it instead.`);
+    }
+    
     // Check lock
     if (!this.lockManager.acquireLock(filePath, agentName)) {
       const owner = this.lockManager.getLockOwner(filePath);
@@ -258,9 +263,10 @@ app.use((req, res, next) => {
 const conversations = new Map();
 
 // Load agent prompts from files
-const BACKEND_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'backend-agent.txt'), 'utf-8');
-const DEVOPS_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'devops-agent.txt'), 'utf-8');
-const FRONTEND_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'frontend-agent.txt'), 'utf-8');
+const TOOLS_USAGE = readFileSync(path.join(__dirname, 'prompts', 'tools-usage.txt'), 'utf-8');
+const BACKEND_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'backend-agent.txt'), 'utf-8') + '\n\n' + TOOLS_USAGE;
+const DEVOPS_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'devops-agent.txt'), 'utf-8') + '\n\n' + TOOLS_USAGE;
+const FRONTEND_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'frontend-agent.txt'), 'utf-8') + '\n\n' + TOOLS_USAGE;
 
 /**
  * Agent class - Autonomous agent that listens to messages and responds
@@ -276,6 +282,7 @@ class Agent {
     this.maxTalkCalls = 30;
     this.isComplete = false;
     this.lastActivityTime = Date.now();
+    this.textOnlyResponses = 0; // Track consecutive text-only responses
     
     // Subscribe to messages for this agent
     this.messageBus.on(`message:${this.name}`, this.handleMessage.bind(this));
@@ -289,6 +296,19 @@ class Agent {
   
   getIdleTime() {
     return Date.now() - this.lastActivityTime;
+  }
+  
+  _getErrorGuidance(functionName, errorMessage) {
+    if (errorMessage.includes('File already exists')) {
+      return 'The file you tried to create already exists. Use str_replace() to modify it, or use read_file() to check its current content first.';
+    } else if (errorMessage.includes('File not found')) {
+      return 'The file does not exist. Use create_file() to create it first, or use list_files() to check what files exist.';
+    } else if (errorMessage.includes('locked by')) {
+      return 'Another agent is currently modifying this file. Wait a moment and try again, or work on a different file.';
+    } else if (errorMessage.includes('String not found')) {
+      return 'The old_string you specified was not found in the file. Use read_file() to check the current file content.';
+    }
+    return 'Check the error message and try a different approach.';
   }
   
   /**
@@ -457,10 +477,24 @@ class Agent {
       
       // Check if agent used a function
       if (responseMessage.function_call) {
+        // Reset text-only counter since agent is taking action
+        this.textOnlyResponses = 0;
+        
         const functionName = responseMessage.function_call.name;
         
         try {
-          const functionArgs = JSON.parse(responseMessage.function_call.arguments);
+          // Parse function arguments with better error handling
+          let functionArgs;
+          try {
+            functionArgs = JSON.parse(responseMessage.function_call.arguments);
+          } catch (jsonError) {
+            console.error(`⚠️  JSON Parse Error for ${functionName}:`);
+            console.error(`   Raw arguments: "${responseMessage.function_call.arguments}"`);
+            console.error(`   Error: ${jsonError.message}`);
+            
+            // Try to fix common JSON issues or skip this call
+            throw new Error(`Invalid JSON in function arguments: ${jsonError.message}`);
+          }
           
           if (functionName === 'talk') {
             await this.talk(functionArgs.agentName, functionArgs.message);
@@ -486,7 +520,7 @@ class Agent {
               type: 'file:created',
               agent: this.name,
               path: functionArgs.path,
-              content: functionArgs.content,
+              content: functionArgs.content.substring(0, 200) + '...', // Truncate for WS
               timestamp: new Date().toISOString()
             });
             
@@ -553,17 +587,53 @@ class Agent {
         } catch (error) {
           console.error(`⚠️  Error executing function ${functionName}: ${error.message}`);
           
-          // Add error to conversation history so agent can retry
+          // Add detailed error to conversation history so agent can adapt
           this.conversationHistory.push({
             role: 'function',
             name: functionName,
-            content: `Error: ${error.message}`
+            content: `ERROR: ${error.message}\n\nWhat went wrong: ${this._getErrorGuidance(functionName, error.message)}`
+          });
+          
+          // Emit error event to WebSocket
+          this.messageBus.emit('ws:broadcast', this.conversationId, {
+            type: 'tool:error',
+            agent: this.name,
+            tool: functionName,
+            error: error.message,
+            timestamp: new Date().toISOString()
           });
         }
       } else {
-        // Agent chose not to respond further
-        console.log(`✅ Agent '${this.name}' chose not to continue the conversation`);
-        this.complete();
+        // Agent responded with text but no function call
+        this.textOnlyResponses++;
+        
+        if (this.textOnlyResponses >= 2) {
+          // After 2 consecutive text-only responses, assume they're done
+          console.log(`✅ Agent '${this.name}' chose not to continue (${this.textOnlyResponses} text-only responses)`);
+          this.complete();
+        } else {
+          // First text-only response - give them a nudge to take action
+          console.log(`⚠️  Agent '${this.name}' responded with text only (${this.textOnlyResponses}/2)`);
+          
+          // Send immediate nudge to take action
+          setTimeout(() => {
+            if (!this.isComplete) {
+              console.log(`🔔 Re-prompting '${this.name}' to take action...`);
+              this.messageBus.emit(`message:${this.name}`, {
+                from: 'system',
+                to: this.name,
+                content: `You just provided a text response without calling any function. To make progress:
+
+- If you're DONE with all your work: Respond with text only again and you'll be marked complete.
+- If you have MORE work to do: Use create_file(), read_file(), list_files(), or str_replace() to actually implement what you just described.
+- If you're waiting for info: Use read_file() or list_files() to discover it yourself, or use talk() to ask and KEEP WORKING simultaneously.
+
+What action will you take now?`,
+                timestamp: new Date().toISOString()
+              });
+            }
+          }, 2000); // Small delay
+        }
       }
       
     } catch (error) {
