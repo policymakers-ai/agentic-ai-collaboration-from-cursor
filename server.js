@@ -92,12 +92,7 @@ class FileSystemTools {
 
   createFile(agentName, filePath, content) {
     const fullPath = this._validatePath(filePath);
-    
-    // Check if file already exists
-    if (existsSync(fullPath)) {
-      throw new Error(`File already exists: ${filePath}. Use str_replace() to modify it instead.`);
-    }
-    
+
     // Check lock
     if (!this.lockManager.acquireLock(filePath, agentName)) {
       const owner = this.lockManager.getLockOwner(filePath);
@@ -268,6 +263,23 @@ const BACKEND_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'backend-age
 const DEVOPS_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'devops-agent.txt'), 'utf-8') + '\n\n' + TOOLS_USAGE;
 const FRONTEND_PROMPT = readFileSync(path.join(__dirname, 'prompts', 'frontend-agent.txt'), 'utf-8') + '\n\n' + TOOLS_USAGE;
 
+function buildWorkspaceContext() {
+  let files = [];
+  try {
+    files = fileTools.listFiles('.');
+  } catch (error) {
+    console.error('⚠️  Failed to list workspace files for prompt context:', error.message);
+  }
+
+  files = Array.isArray(files) ? files.sort() : [];
+
+  const fileList = files.length
+    ? files.map(file => `- ${file}`).join('\n')
+    : '- (none yet — workspace is empty)';
+
+  return `\n\nCURRENT WORKSPACE FILES:\n${fileList}\n`;
+}
+
 /**
  * Agent class - Autonomous agent that listens to messages and responds
  */
@@ -283,6 +295,9 @@ class Agent {
     this.isComplete = false;
     this.lastActivityTime = Date.now();
     this.textOnlyResponses = 0; // Track consecutive text-only responses
+    this.inbox = [];
+    this.isProcessing = false;
+    this.needsAnotherRun = false;
     
     // Subscribe to messages for this agent
     this.messageBus.on(`message:${this.name}`, this.handleMessage.bind(this));
@@ -297,6 +312,22 @@ class Agent {
   getIdleTime() {
     return Date.now() - this.lastActivityTime;
   }
+
+  _sanitizeArgs(args = {}) {
+    const clone = JSON.parse(JSON.stringify(args));
+    const truncate = (value) => {
+      if (typeof value !== 'string') return value;
+      return value.length > 200 ? `${value.slice(0, 200)}...` : value;
+    };
+
+    ['content', 'old_string', 'new_string', 'message'].forEach((key) => {
+      if (clone[key]) {
+        clone[key] = truncate(clone[key]);
+      }
+    });
+
+    return clone;
+  }
   
   _getErrorGuidance(functionName, errorMessage) {
     if (errorMessage.includes('File already exists')) {
@@ -310,29 +341,158 @@ class Agent {
     }
     return 'Check the error message and try a different approach.';
   }
-  
-  /**
-   * Handle incoming messages
-   */
-  async handleMessage(message) {
-    this.updateActivity();
-    
-    if (this.isComplete) {
-      console.log(`⏹️  Agent '${this.name}' has already completed, ignoring message`);
-      return;
+
+  _queueMessage(message) {
+    if (!message) return;
+    this.inbox.push(message);
+    console.log(`📥 ${this.name.toUpperCase()} queued message from ${message.from}. Inbox size: ${this.inbox.length}`);
+    this._broadcastInboxEvent('received', {
+      from: message.from,
+      preview: this._truncateText(message.content, 50)
+    });
+  }
+
+  _broadcastInboxEvent(action, extra = {}) {
+    this.messageBus.emit('ws:broadcast', this.conversationId, {
+      type: 'agent:inbox',
+      agent: this.name,
+      action,
+      count: this.inbox.length,
+      ...extra,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  _truncateText(text, length = 160) {
+    if (!text) return '';
+    return text.length > length ? `${text.slice(0, length)}...` : text;
+  }
+
+  _resumeFromCompletion(reason) {
+    if (!this.isComplete) return;
+    this.isComplete = false;
+    this.messageBus.emit('agent:resumed', {
+      conversationId: this.conversationId,
+      agentName: this.name,
+      reason
+    });
+    this.messageBus.emit('ws:broadcast', this.conversationId, {
+      type: 'agent:status',
+      agent: this.name,
+      status: 'thinking',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  async _processQueue() {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+    try {
+      while (this.needsAnotherRun && !this.isComplete) {
+        this.needsAnotherRun = false;
+        await this._executeAgentTurn();
+      }
+    } finally {
+      this.isProcessing = false;
     }
-    
-    console.log(`\n📨 Agent '${this.name}' received message from '${message.from}':`);
-    console.log(`   "${message.content}"`);
-    
-    // Add message to conversation history
+  }
+
+  _buildMessages() {
+    const messages = [
+      { role: 'system', content: this.systemPrompt },
+      ...this.conversationHistory
+    ];
+
+    if (this.inbox.length > 0) {
+      messages.push({
+        role: 'system',
+        content: `You have ${this.inbox.length} unread message(s) waiting in your inbox. Use read_message() to read the latest message (most recent first) before responding.`
+      });
+    }
+
+    return messages;
+  }
+
+  _deliverMessageImmediately(message) {
+    if (!message) return;
     this.conversationHistory.push({
       role: 'user',
       content: `Message from ${message.from}: ${message.content}`
     });
-    
+    this.messageBus.emit('ws:broadcast', this.conversationId, {
+      type: 'agent:message',
+      agent: this.name,
+      from: message.from,
+      content: this._truncateText(message.content, 200),
+      delivery: 'immediate',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  _readNextInboxMessage() {
+    if (this.inbox.length === 0) {
+      return {
+        response: 'Inbox empty. No unread messages.',
+        messageRead: false
+      };
+    }
+
+    const message = this.inbox.pop();
+    const formatted = `Message from ${message.from}: ${message.content}`;
+    this.conversationHistory.push({
+      role: 'user',
+      content: formatted
+    });
+
+    this._broadcastInboxEvent('read', {
+      from: message.from,
+      preview: this._truncateText(message.content, 50)
+    });
+
+    console.log(`📖 ${this.name.toUpperCase()} read message from ${message.from}. Remaining inbox: ${this.inbox.length}`);
+
+    return {
+      response: formatted,
+      messageRead: true
+    };
+  }
+  
+  /**
+   * Handle incoming messages / triggers
+   */
+  async handleMessage(message) {
+    this.updateActivity();
+
+    if (message) {
+      const shouldQueue = message.queue === true;
+      if (shouldQueue) {
+        this._queueMessage(message);
+        if (this.isComplete) {
+          this._resumeFromCompletion('message_received');
+        }
+      } else {
+        this._deliverMessageImmediately(message);
+      }
+    }
+
+    if (this.isComplete && !message) {
+      console.log(`⏹️  Agent '${this.name}' is complete and no new work to process.`);
+      return;
+    }
+
+    this.needsAnotherRun = true;
+    await this._processQueue();
+  }
+
+  /**
+   * Execute one agent reasoning turn
+   */
+  async _executeAgentTurn() {
+    if (this.isComplete) {
+      return;
+    }
+
     try {
-      // Update status to thinking
       this.messageBus.emit('ws:broadcast', this.conversationId, {
         type: 'agent:status',
         agent: this.name,
@@ -340,56 +500,58 @@ class Agent {
         timestamp: new Date().toISOString()
       });
 
-      // Check if we've exceeded talk calls
       if (this.talkCallCount >= this.maxTalkCalls) {
         console.log(`⚠️  Agent '${this.name}' has reached max talk calls (${this.maxTalkCalls}), marking as complete`);
         this.complete();
         return;
       }
       
-      // Call LLM with OpenAI function calling
       console.log(`🧠 Agent '${this.name}' is thinking... (calls remaining: ${this.maxTalkCalls - this.talkCallCount})`);
       
-      // Build messages for OpenAI
-      const messages = [
-        { role: 'system', content: this.systemPrompt },
-        ...this.conversationHistory
-      ];
+      const messages = this._buildMessages();
       
-      // Define available functions
       const functions = [
         {
           name: 'talk',
-          description: `Send a message to another agent. You have ${this.maxTalkCalls - this.talkCallCount} calls remaining out of ${this.maxTalkCalls}.`,
+          description: `Send a message to another agent. ${this.maxTalkCalls - this.talkCallCount} calls remaining.`,
           parameters: {
             type: 'object',
             properties: {
               agentName: {
                 type: 'string',
                 enum: ['backend', 'devops', 'frontend'],
-                description: 'The name of the agent to send the message to'
+                description: 'Agent to message'
               },
               message: {
                 type: 'string',
-                description: 'The message content to send to the other agent'
+                description: 'Your message'
               }
             },
             required: ['agentName', 'message']
           }
         },
         {
+          name: 'read_message',
+          description: 'Read the most recent message from your inbox queue.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        },
+        {
           name: 'create_file',
-          description: 'Create a new file in the /tmp/project/ workspace',
+          description: 'CREATE a new file NOW. Put the complete file content in the content parameter. DO NOT describe it in text.',
           parameters: {
             type: 'object',
             properties: {
               path: {
                 type: 'string',
-                description: 'Relative path from /tmp/project/ (e.g., "backend/api.js")'
+                description: 'Path like "backend/server.js" or "Dockerfile"'
               },
               content: {
                 type: 'string',
-                description: 'The content to write to the file'
+                description: 'Complete file content - NOT a description, the ACTUAL code/config'
               }
             },
             required: ['path', 'content']
@@ -397,13 +559,13 @@ class Agent {
         },
         {
           name: 'read_file',
-          description: 'Read the content of a file from the workspace',
+          description: 'READ a file to see what it contains.',
           parameters: {
             type: 'object',
             properties: {
               path: {
                 type: 'string',
-                description: 'Relative path from /tmp/project/'
+                description: 'Path to read'
               }
             },
             required: ['path']
@@ -411,21 +573,21 @@ class Agent {
         },
         {
           name: 'str_replace',
-          description: 'Replace a string in a file with a new string',
+          description: 'MODIFY an existing file by replacing text. old_string must match exactly.',
           parameters: {
             type: 'object',
             properties: {
               path: {
                 type: 'string',
-                description: 'Relative path from /tmp/project/'
+                description: 'File to modify'
               },
               old_string: {
                 type: 'string',
-                description: 'The exact string to replace'
+                description: 'Exact text to find'
               },
               new_string: {
                 type: 'string',
-                description: 'The new string to replace it with'
+                description: 'Replacement text'
               }
             },
             required: ['path', 'old_string', 'new_string']
@@ -433,13 +595,81 @@ class Agent {
         },
         {
           name: 'list_files',
-          description: 'List all files in a directory within the workspace',
+          description: 'LIST all files in a directory.',
           parameters: {
             type: 'object',
             properties: {
               directory: {
                 type: 'string',
-                description: 'Relative directory path (e.g., "." or "backend/")'
+                description: 'Directory path like "." or "backend/"'
+              }
+            },
+            required: ['directory']
+          }
+        },
+        {
+          name: 'create_file',
+          description: 'CREATE a new file NOW. Put the complete file content in the content parameter. DO NOT describe it in text.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Path like "backend/server.js" or "Dockerfile"'
+              },
+              content: {
+                type: 'string',
+                description: 'Complete file content - NOT a description, the ACTUAL code/config'
+              }
+            },
+            required: ['path', 'content']
+          }
+        },
+        {
+          name: 'read_file',
+          description: 'READ a file to see what it contains.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Path to read'
+              }
+            },
+            required: ['path']
+          }
+        },
+        {
+          name: 'str_replace',
+          description: 'MODIFY an existing file by replacing text. old_string must match exactly.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'File to modify'
+              },
+              old_string: {
+                type: 'string',
+                description: 'Exact text to find'
+              },
+              new_string: {
+                type: 'string',
+                description: 'Replacement text'
+              }
+            },
+            required: ['path', 'old_string', 'new_string']
+          }
+        },
+        {
+          name: 'list_files',
+          description: 'LIST all files in a directory.',
+          parameters: {
+            type: 'object',
+            properties: {
+              directory: {
+                type: 'string',
+                description: 'Directory path like "." or "backend/"'
               }
             },
             required: ['directory']
@@ -447,22 +677,28 @@ class Agent {
         }
       ];
       
-      // For the first call, guide towards using the function
-      // After that, let the agent decide
-      const shouldForceFunction = this.talkCallCount === 0;
+      const totalInteractions = this.conversationHistory.filter(m => m.role === 'user').length;
+      let functionCallMode;
+      
+      if (this.talkCallCount === 0) {
+        functionCallMode = { name: 'talk' };
+      } else if (totalInteractions < 3) {
+        functionCallMode = 'auto';
+      } else {
+        functionCallMode = 'auto';
+      }
       
       const result = await openaiClient.chat.completions.create({
         model: 'gpt-4-turbo-preview',
         messages: messages,
         functions: functions,
-        function_call: shouldForceFunction ? { name: 'talk' } : 'auto',
-        temperature: 0.7,
-        max_tokens: 500
+        function_call: functionCallMode,
+        temperature: 0.3,
+        max_tokens: 1500
       });
       
       const responseMessage = result.choices[0].message;
       
-      // Print agent's text response if they have one
       if (responseMessage.content) {
         console.log(`\n💭 ${this.name.toUpperCase()} Agent says:`);
         console.log(`   ${responseMessage.content}\n`);
@@ -475,15 +711,12 @@ class Agent {
         });
       }
       
-      // Check if agent used a function
       if (responseMessage.function_call) {
-        // Reset text-only counter since agent is taking action
         this.textOnlyResponses = 0;
         
         const functionName = responseMessage.function_call.name;
         
         try {
-          // Parse function arguments with better error handling
           let functionArgs;
           try {
             functionArgs = JSON.parse(responseMessage.function_call.arguments);
@@ -492,10 +725,41 @@ class Agent {
             console.error(`   Raw arguments: "${responseMessage.function_call.arguments}"`);
             console.error(`   Error: ${jsonError.message}`);
             
-            // Try to fix common JSON issues or skip this call
-            throw new Error(`Invalid JSON in function arguments: ${jsonError.message}`);
+            this.conversationHistory.push({
+              role: 'function',
+              name: functionName,
+              content: `ERROR: JSON parsing failed - ${jsonError.message}
+
+Your function call was incomplete or malformed. This often happens when:
+1. The 'content' parameter for create_file is too long and got cut off
+2. You didn't close quotes or brackets properly
+
+Try again with:
+- Shorter, more focused file content
+- Multiple create_file() calls for multiple files instead of one giant file
+- Ensure your JSON is valid`
+            });
+
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'tool:error',
+              agent: this.name,
+              tool: functionName,
+              error: `JSON parse error: ${jsonError.message}`,
+              timestamp: new Date().toISOString()
+            });
+            
+            return;
           }
           
+          const sanitizedArgs = this._sanitizeArgs(functionArgs);
+          this.messageBus.emit('ws:broadcast', this.conversationId, {
+            type: 'tool:call',
+            agent: this.name,
+            tool: functionName,
+            args: sanitizedArgs,
+            timestamp: new Date().toISOString()
+          });
+
           if (functionName === 'talk') {
             await this.talk(functionArgs.agentName, functionArgs.message);
           } else if (functionName === 'create_file') {
@@ -523,6 +787,14 @@ class Agent {
               content: functionArgs.content.substring(0, 200) + '...', // Truncate for WS
               timestamp: new Date().toISOString()
             });
+
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'tool:result',
+              agent: this.name,
+              tool: functionName,
+              result,
+              timestamp: new Date().toISOString()
+            });
             
           } else if (functionName === 'read_file') {
             const content = fileTools.readFile(functionArgs.path);
@@ -538,6 +810,14 @@ class Agent {
               type: 'file:read',
               agent: this.name,
               path: functionArgs.path,
+              timestamp: new Date().toISOString()
+            });
+
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'tool:result',
+              agent: this.name,
+              tool: functionName,
+              result: content.length > 200 ? `${content.slice(0, 200)}...` : content,
               timestamp: new Date().toISOString()
             });
             
@@ -564,6 +844,14 @@ class Agent {
               changes: `Replaced "${functionArgs.old_string}" with "${functionArgs.new_string}"`,
               timestamp: new Date().toISOString()
             });
+
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'tool:result',
+              agent: this.name,
+              tool: functionName,
+              result,
+              timestamp: new Date().toISOString()
+            });
             
           } else if (functionName === 'list_files') {
             const files = fileTools.listFiles(functionArgs.directory || '.');
@@ -582,6 +870,25 @@ class Agent {
               files: files,
               timestamp: new Date().toISOString()
             });
+
+            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              type: 'tool:result',
+              agent: this.name,
+              tool: functionName,
+              result: `Found ${files.length} file(s)`,
+              timestamp: new Date().toISOString()
+            });
+          } else if (functionName === 'read_message') {
+            const delivery = this._readNextInboxMessage();
+            this.conversationHistory.push({
+              role: 'function',
+              name: functionName,
+              content: delivery.response
+            });
+
+            if (delivery.messageRead) {
+              this.needsAnotherRun = true;
+            }
           }
           
         } catch (error) {
@@ -661,7 +968,8 @@ What action will you take now?`,
       from: this.name,
       to: agentName,
       content: message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      queue: true
     });
     
     // Emit event for WebSocket
@@ -762,10 +1070,18 @@ app.post('/start-conversation', async (req, res) => {
       console.log(`\n✓ Agent '${data.agentName}' completed (${completedAgents.size}/3 agents done)\n`);
     });
     
-    // Create all three agents
-    const backendAgent = new Agent('backend', BACKEND_PROMPT, conversationId, messageBus);
-    const devopsAgent = new Agent('devops', DEVOPS_PROMPT, conversationId, messageBus);
-    const frontendAgent = new Agent('frontend', FRONTEND_PROMPT, conversationId, messageBus);
+    messageBus.on('agent:resumed', (data) => {
+      if (completedAgents.has(data.agentName)) {
+        completedAgents.delete(data.agentName);
+      }
+      console.log(`\n↺ Agent '${data.agentName}' resumed work (reason: ${data.reason || 'new message'})\n`);
+    });
+    
+    const workspaceContext = buildWorkspaceContext();
+    // Create all three agents with workspace awareness
+    const backendAgent = new Agent('backend', BACKEND_PROMPT + workspaceContext, conversationId, messageBus);
+    const devopsAgent = new Agent('devops', DEVOPS_PROMPT + workspaceContext, conversationId, messageBus);
+    const frontendAgent = new Agent('frontend', FRONTEND_PROMPT + workspaceContext, conversationId, messageBus);
     
     const agents = { backend: backendAgent, devops: devopsAgent, frontend: frontendAgent };
     
@@ -918,6 +1234,36 @@ app.post('/stop-conversation', (req, res) => {
   }
   
   res.status(404).json({ error: 'Conversation control not found or already finished' });
+});
+
+/**
+ * POST /wipe-workspace
+ * Clears the /tmp/project workspace
+ */
+app.post('/wipe-workspace', (req, res) => {
+  try {
+    const { conversationId: targetConversationId } = req.body || {};
+    fileTools.wipeWorkspace();
+
+    const eventPayload = {
+      type: 'workspace:wiped',
+      timestamp: new Date().toISOString(),
+      message: 'Workspace reset to empty state'
+    };
+
+    if (targetConversationId) {
+      broadcastToConversation(targetConversationId, eventPayload);
+    } else {
+      for (const convId of conversationClients.keys()) {
+        broadcastToConversation(convId, eventPayload);
+      }
+    }
+
+    res.json({ success: true, message: 'Workspace wiped successfully' });
+  } catch (error) {
+    console.error('❌ Failed to wipe workspace:', error);
+    res.status(500).json({ error: 'Failed to wipe workspace', details: error.message });
+  }
 });
 
 /**

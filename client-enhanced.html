@@ -71,6 +71,14 @@
             opacity: 0.5;
             cursor: not-allowed;
         }
+
+        .secondary {
+            background: #6b7280;
+        }
+        
+        .secondary:hover {
+            background: #4b5563;
+        }
         
         #stopBtn {
             background: #ef4444;
@@ -148,6 +156,11 @@
         .log-entry.talk { border-left: 4px solid #f59e0b; }
         .log-entry.file { border-left: 4px solid #3b82f6; }
         .log-entry.status { border-left: 4px solid #10b981; }
+        .log-entry.tool-call { border-left: 4px solid #6366f1; }
+        .log-entry.tool-result { border-left: 4px solid #14b8a6; }
+        .log-entry.tool-error { border-left: 4px solid #ef4444; }
+        .log-entry.inbox { border-left: 4px solid #ec4899; }
+        .log-entry.message { border-left: 4px solid #0ea5e9; }
 
         .log-timestamp {
             font-size: 0.7rem;
@@ -195,6 +208,7 @@
             <input type="text" id="topic" placeholder="Describe your project (e.g., 'Build a todo app')" value="Build a simple REST API with Node.js">
             <button onclick="startConversation()" id="startBtn">Start Building</button>
             <button onclick="stopConversation()" id="stopBtn">Stop</button>
+            <button onclick="wipeWorkspace()" id="wipeBtn" class="secondary">Wipe Workspace</button>
         </div>
     </div>
 
@@ -238,6 +252,16 @@
     <script>
         let ws;
         let conversationId;
+        
+        function escapeHtml(str) {
+            if (typeof str !== 'string') return str;
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
 
         function connectWebSocket(id) {
             if (ws) ws.close();
@@ -278,6 +302,49 @@
                 case 'agent:talk':
                     addLog(data.agent, 'talk', `To ${data.to}: ${data.message}`);
                     break;
+                
+                case 'agent:message':
+                    addLog(
+                        data.agent,
+                        'message',
+                        `Received from ${data.from}${data.delivery ? ` (${data.delivery})` : ''}: ${data.content}`
+                    );
+                    break;
+                
+                case 'agent:inbox':
+                    if (data.action === 'received') {
+                        const preview = data.preview ? ` ${data.preview}` : '';
+                        addLog(
+                            data.agent,
+                            'inbox',
+                            `Inbox: new message from ${data.from}.${preview ? ' ' + preview : ''} ${data.count} unread.`
+                        );
+                    } else if (data.action === 'read') {
+                        const preview = data.preview ? ` ${data.preview}` : '';
+                        addLog(
+                            data.agent,
+                            'inbox',
+                            `Read message (${data.count} left). Message from ${data.from}:${preview ? ' ' + preview : ''}`
+                        );
+                    } else {
+                        addLog(data.agent, 'inbox', `Inbox updated. ${data.count} unread.`);
+                    }
+                    break;
+                
+                case 'tool:call':
+                    if (data.tool === 'talk') {
+                        break; // talk already logged via agent:talk
+                    }
+                    addLog(data.agent, 'tool-call', `${data.agent} calling ${data.tool}\nArgs:\n${JSON.stringify(data.args, null, 2)}`);
+                    break;
+                
+                case 'tool:result':
+                    addLog(data.agent, 'tool-result', `${data.tool} result:\n${data.result || '(no result returned)'}`);
+                    break;
+                
+                case 'tool:error':
+                    addLog(data.agent, 'tool-error', `${data.tool} error:\n${data.error}`);
+                    break;
                     
                 case 'file:created':
                     addLog(data.agent, 'file', `Created file: ${data.path}`);
@@ -301,6 +368,12 @@
                     document.getElementById('startBtn').disabled = false;
                     document.getElementById('stopBtn').style.display = 'none';
                     break;
+
+                case 'workspace:wiped':
+                    files.clear();
+                    document.getElementById('file-tree').innerHTML = '';
+                    addLog('system', 'status', data.message || 'Workspace wiped');
+                    break;
             }
         }
 
@@ -313,17 +386,20 @@
         }
 
         function addLog(agent, type, content) {
-            const logsContainer = document.getElementById(`${agent === 'system' ? 'backend' : agent}-logs`);
+            const columnId = agent === 'system' ? 'backend' : agent;
+            const logsContainer = document.getElementById(`${columnId}-logs`);
             if (!logsContainer) return;
 
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
             
             const timestamp = new Date().toLocaleTimeString();
-            
+            const normalizedContent = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+            const safeContent = escapeHtml(normalizedContent);
+
             entry.innerHTML = `
                 <div class="log-timestamp">${timestamp}</div>
-                <div class="log-content">${content}</div>
+                <div class="log-content">${safeContent}</div>
             `;
             
             logsContainer.appendChild(entry);
@@ -387,6 +463,33 @@
                 addLog('system', 'status', 'Stop requested...');
             } catch (err) {
                 console.error(err);
+            }
+        }
+
+        async function wipeWorkspace() {
+            const wipeBtn = document.getElementById('wipeBtn');
+            wipeBtn.disabled = true;
+
+            try {
+                const res = await fetch('/wipe-workspace', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ conversationId: conversationId || null })
+                });
+
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.error || 'Failed to wipe workspace');
+                }
+
+                files.clear();
+                document.getElementById('file-tree').innerHTML = '';
+                addLog('system', 'status', data.message || 'Workspace wiped');
+            } catch (err) {
+                console.error(err);
+                alert('Failed to wipe workspace: ' + err.message);
+            } finally {
+                wipeBtn.disabled = false;
             }
         }
     </script>
