@@ -476,6 +476,73 @@ class Agent {
       ...this.conversationHistory
     ];
 
+    // CRITICAL: Verify that ALL assistant messages with tool_calls have all tool responses
+    // OpenAI requires EVERY assistant message with tool_calls to be immediately followed by tool responses
+    // We must check ALL of them, not just the most recent one (race condition fix)
+    const assistantMessagesWithToolCalls = [];
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        assistantMessagesWithToolCalls.push({ index: i, message: msg });
+      }
+    }
+    
+    // Check each assistant message with tool_calls (from oldest to newest to maintain indices)
+    for (const { index: i, message: msg } of assistantMessagesWithToolCalls) {
+      console.log(`🔍 [${this.name}] _buildMessages: Checking assistant message at index ${i} with ${msg.tool_calls.length} tool_calls`);
+      // Find all tool responses that follow this assistant message (until next assistant message)
+      const toolResponseIds = new Set();
+      const foundToolCallIds = [];
+      const nextAssistantIndex = assistantMessagesWithToolCalls.find(am => am.index > i)?.index ?? messages.length;
+      
+      for (let j = i + 1; j < nextAssistantIndex; j++) {
+        if (messages[j].role === 'tool' && messages[j].tool_call_id) {
+          toolResponseIds.add(messages[j].tool_call_id);
+          foundToolCallIds.push(messages[j].tool_call_id);
+        }
+      }
+      
+      // Check if all tool_call_ids have responses
+      const missingIds = msg.tool_calls.filter(tc => !toolResponseIds.has(tc.id));
+      const requiredIds = msg.tool_calls.map(tc => tc.id);
+      console.log(`🔍 [${this.name}] _buildMessages: Required IDs: ${requiredIds.join(', ')}`);
+      console.log(`🔍 [${this.name}] _buildMessages: Found IDs: ${foundToolCallIds.join(', ')}`);
+      console.log(`🔍 [${this.name}] _buildMessages: Found ${toolResponseIds.size} tool responses, need ${msg.tool_calls.length}, missing: ${missingIds.length}`);
+      
+      if (missingIds.length > 0) {
+        console.error(`❌ [${this.name}] CRITICAL: Assistant message at index ${i} missing responses for: ${missingIds.map(tc => tc.id).join(', ')}`);
+        // Add missing responses immediately after the assistant message
+        // Insert them in reverse order so indices don't shift
+        for (let k = missingIds.length - 1; k >= 0; k--) {
+          const toolCall = missingIds[k];
+          const errorResponse = {
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: `ERROR: Tool call was not processed. This may be due to an internal error.`
+          };
+          messages.splice(i + 1, 0, errorResponse);
+          // Update indices for remaining assistant messages
+          for (let amIdx = 0; amIdx < assistantMessagesWithToolCalls.length; amIdx++) {
+            if (assistantMessagesWithToolCalls[amIdx].index > i) {
+              assistantMessagesWithToolCalls[amIdx].index++;
+            }
+          }
+          // Also add to conversation history for future calls
+          const historyIndex = this.conversationHistory.findIndex(m => 
+            m.role === 'assistant' && 
+            m.tool_calls && 
+            m.tool_calls.some(tc => tc.id === toolCall.id)
+          );
+          if (historyIndex >= 0) {
+            this.conversationHistory.splice(historyIndex + 1, 0, errorResponse);
+          }
+        }
+        console.log(`✅ [${this.name}] Added ${missingIds.length} missing tool responses in _buildMessages()`);
+      } else {
+        console.log(`✅ [${this.name}] Assistant message at index ${i} has all tool responses`);
+      }
+    }
+
     if (this.inbox.length > 0) {
       messages.push({
         role: 'system',
@@ -769,15 +836,78 @@ class Agent {
       ];
       
       const totalInteractions = this.conversationHistory.filter(m => m.role === 'user').length;
-      let functionCallMode = 'auto';
+      let toolChoice = 'auto';
+      
+      // Convert functions to tools format for newer API
+      const tools = functions.map(fn => ({
+        type: 'function',
+        function: fn
+      }));
+      
+      // Final verification before API call - check ALL assistant messages with tool_calls
+      const allAssistantMsgs = [];
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role === 'assistant' && messages[i].tool_calls && messages[i].tool_calls.length > 0) {
+          allAssistantMsgs.push({ index: i, msg: messages[i] });
+        }
+      }
+      
+      let anyMissing = false;
+      for (const { index: i, msg } of allAssistantMsgs) {
+        const toolResponseIds = new Set();
+        const nextAssistantIndex = allAssistantMsgs.find(am => am.index > i)?.index ?? messages.length;
+        
+        for (let j = i + 1; j < nextAssistantIndex; j++) {
+          if (messages[j].role === 'tool' && messages[j].tool_call_id) {
+            toolResponseIds.add(messages[j].tool_call_id);
+          }
+        }
+        
+        const missing = msg.tool_calls.filter(tc => !toolResponseIds.has(tc.id));
+        if (missing.length > 0) {
+          anyMissing = true;
+          console.error(`❌ [${this.name}] FINAL CHECK: Assistant at index ${i} missing responses for: ${missing.map(tc => tc.id).join(', ')}`);
+          // Force add them RIGHT AFTER the assistant message
+          for (let k = missing.length - 1; k >= 0; k--) {
+            const toolCall = missing[k];
+            const errorResponse = {
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: `ERROR: Tool call was not processed. This may be due to an internal error.`
+            };
+            messages.splice(i + 1, 0, errorResponse);
+            // Update indices for remaining assistant messages
+            for (let amIdx = 0; amIdx < allAssistantMsgs.length; amIdx++) {
+              if (allAssistantMsgs[amIdx].index > i) {
+                allAssistantMsgs[amIdx].index++;
+              }
+            }
+            console.log(`✅ [${this.name}] FINAL CHECK: Added missing response for ${toolCall.id} at index ${i + 1}`);
+          }
+        }
+      }
+      
+      if (!anyMissing && allAssistantMsgs.length > 0) {
+        console.log(`✅ [${this.name}] FINAL CHECK: All ${allAssistantMsgs.length} assistant message(s) with tool_calls have all responses`);
+      }
+      
+      // DEBUG: Log the actual messages structure being sent to OpenAI
+      if (allAssistantMsgs.length > 0) {
+        console.log(`🔍 [${this.name}] DEBUG: Messages array structure before API call:`);
+        for (const { index: i, msg } of allAssistantMsgs) {
+          const nextAssistantIndex = allAssistantMsgs.find(am => am.index > i)?.index ?? messages.length;
+          const followingMessages = messages.slice(i, Math.min(i + 5, nextAssistantIndex));
+          console.log(`   Assistant at ${i}: ${msg.tool_calls.length} tool_calls, following messages: ${followingMessages.map(m => `${m.role}${m.tool_call_id ? `(tool_call_id:${m.tool_call_id})` : ''}`).join(', ')}`);
+        }
+      }
       
       const result = await openaiClient.chat.completions.create({
-        model: 'gpt-4-turbo-preview',
+        model: 'gpt-5.1',
         messages: messages,
-        functions: functions,
-        function_call: functionCallMode,
+        tools: tools,
+        tool_choice: toolChoice,
         temperature: 0.3,
-        max_tokens: 1500
+        max_completion_tokens: 1500
       });
       
       const responseMessage = result.choices[0].message;
@@ -794,24 +924,74 @@ class Agent {
         });
       }
       
-      if (responseMessage.function_call) {
+      if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
+        // Add assistant message with tool_calls to history BEFORE processing tool calls
+        // This ensures tool responses can reference the tool_call_ids
+        this.conversationHistory.push({
+          role: 'assistant',
+          content: responseMessage.content || null,
+          tool_calls: responseMessage.tool_calls
+        });
+        // CRITICAL: Track the assistant message - we must insert tool responses IMMEDIATELY after it
+        // Use a helper function to find the insertion point (right after the assistant message)
+        const getToolResponseInsertionIndex = () => {
+          // Find the most recent assistant message with tool_calls that matches our responseMessage
+          for (let idx = this.conversationHistory.length - 1; idx >= 0; idx--) {
+            const msg = this.conversationHistory[idx];
+            if (msg.role === 'assistant' && msg.tool_calls && 
+                msg.tool_calls.some(tc => responseMessage.tool_calls.some(rtc => rtc.id === tc.id))) {
+              // Found it - check what's at idx+1
+              const nextIdx = idx + 1;
+              const nextMsg = this.conversationHistory[nextIdx];
+              console.log(`📍 [${this.name}] Found assistant message at index ${idx}, next index ${nextIdx} has: ${nextMsg ? nextMsg.role : 'nothing'}`);
+              // Count how many tool responses already exist for this assistant message
+              let toolResponseCount = 0;
+              for (let j = nextIdx; j < this.conversationHistory.length; j++) {
+                const checkMsg = this.conversationHistory[j];
+                if (checkMsg.role === 'tool' && checkMsg.tool_call_id && 
+                    msg.tool_calls.some(tc => tc.id === checkMsg.tool_call_id)) {
+                  toolResponseCount++;
+                } else if (checkMsg.role === 'assistant') {
+                  break; // Stop at next assistant message
+                }
+              }
+              console.log(`📍 [${this.name}] Assistant message has ${toolResponseCount} tool responses already, will insert at index ${nextIdx + toolResponseCount}`);
+              return nextIdx + toolResponseCount;
+            }
+          }
+          // Fallback: insert at end
+          console.warn(`⚠️  [${this.name}] Could not find assistant message, inserting at end (index ${this.conversationHistory.length})`);
+          return this.conversationHistory.length;
+        };
+        
         this.textOnlyResponses = 0;
         
-        const functionName = responseMessage.function_call.name;
+        // Track which tool_call_ids have been processed
+        const processedToolCallIds = new Set();
+        // Collect system messages to add AFTER all tool responses (OpenAI requires tool responses to be consecutive)
+        const deferredSystemMessages = [];
         
         try {
+          // Process each tool call
+          for (const toolCall of responseMessage.tool_calls) {
+          const functionName = toolCall.function.name;
+          const toolCallId = toolCall.id;
+          console.log(`🔧 [${this.name}] Processing tool call: ${functionName} (${toolCallId})`);
+          
           let functionArgs;
           try {
-            functionArgs = JSON.parse(responseMessage.function_call.arguments);
+            functionArgs = JSON.parse(toolCall.function.arguments);
           } catch (jsonError) {
-            console.error(`⚠️  JSON Parse Error for ${functionName}:`);
-            console.error(`   Raw arguments: "${responseMessage.function_call.arguments}"`);
-            console.error(`   Error: ${jsonError.message}`);
-            
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
-              content: `ERROR: JSON parsing failed - ${jsonError.message}
+              console.error(`⚠️  JSON Parse Error for ${functionName}:`);
+              console.error(`   Raw arguments: "${toolCall.function.arguments}"`);
+              console.error(`   Error: ${jsonError.message}`);
+              
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: `ERROR: JSON parsing failed - ${jsonError.message}
 
 Your function call was incomplete or malformed. This often happens when:
 1. The 'content' parameter for create_file is too long and got cut off
@@ -821,17 +1001,18 @@ Try again with:
 - Shorter, more focused file content
 - Multiple create_file() calls for multiple files instead of one giant file
 - Ensure your JSON is valid`
-            });
+              });
+              processedToolCallIds.add(toolCallId);
 
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
-              type: 'tool:error',
-              agent: this.name,
-              tool: functionName,
-              error: `JSON parse error: ${jsonError.message}`,
-              timestamp: new Date().toISOString()
-            });
-            
-            return;
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
+                type: 'tool:error',
+                agent: this.name,
+                tool: functionName,
+                error: `JSON parse error: ${jsonError.message}`,
+                timestamp: new Date().toISOString()
+              });
+              
+              continue; // Skip this tool call and process next one
           }
           
           const sanitizedArgs = this._sanitizeArgs(functionArgs);
@@ -843,85 +1024,85 @@ Try again with:
             timestamp: new Date().toISOString()
           });
 
-          if (functionName === 'talk') {
-            await this.talk(functionArgs.agentName, functionArgs.message);
-            this.conversationHistory.push({
-              role: 'system',
-              content: `${functionName} succeeded and message to ${functionArgs.agentName} was sent. Proceed with next planned changes.`
-            });
-            this.messageBus.emit(`message:${this.name}`, {
-              from: 'system',
-              to: this.name,
-              content: 'Tool call completed. Continue building.',
-              autoRun: true,
-              deliverImmediately: true,
-              timestamp: new Date().toISOString()
-            });
-          } else if (functionName === 'create_file') {
-            const result = fileTools.createFile(this.name, functionArgs.path, functionArgs.content);
-            console.log(`📝 ${this.name.toUpperCase()} created file: ${functionArgs.path}`);
-            
-            // Add result to conversation history so agent knows it succeeded
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
-              content: result
-            });
-            
-            // Emit file event
-            this.messageBus.emit('file:created', {
-              agent: this.name,
-              path: functionArgs.path,
-              timestamp: new Date().toISOString()
-            });
-            
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
-              type: 'file:created',
-              agent: this.name,
-              path: functionArgs.path,
-              content: functionArgs.content.substring(0, 200) + '...', // Truncate for WS
-              timestamp: new Date().toISOString()
-            });
+          try {
+            if (functionName === 'talk') {
+              const result = await this.talk(functionArgs.agentName, functionArgs.message);
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: result || `Message sent to ${functionArgs.agentName}`
+              });
+              processedToolCallIds.add(toolCallId);
+              console.log(`✅ [${this.name}] Added tool response for ${toolCallId} at index ${insertIndex}`);
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
+                role: 'system',
+                content: `${functionName} succeeded and message to ${functionArgs.agentName} was sent. Proceed with next planned changes.`
+              });
+            } else if (functionName === 'create_file') {
+              const result = fileTools.createFile(this.name, functionArgs.path, functionArgs.content);
+              console.log(`📝 ${this.name.toUpperCase()} created file: ${functionArgs.path}`);
+              
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: result
+              });
+              processedToolCallIds.add(toolCallId);
+              
+              // Emit file event
+              this.messageBus.emit('file:created', {
+                agent: this.name,
+                path: functionArgs.path,
+                timestamp: new Date().toISOString()
+              });
+              
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
+                type: 'file:created',
+                agent: this.name,
+                path: functionArgs.path,
+                content: functionArgs.content.substring(0, 200) + '...', // Truncate for WS
+                timestamp: new Date().toISOString()
+              });
 
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
-              type: 'tool:result',
-              agent: this.name,
-              tool: functionName,
-              result,
-              timestamp: new Date().toISOString()
-            });
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
+                type: 'tool:result',
+                agent: this.name,
+                tool: functionName,
+                result,
+                timestamp: new Date().toISOString()
+              });
 
-            this.conversationHistory.push({
-              role: 'system',
-              content: `${functionName} succeeded and file ${functionArgs.path} is successfully created. Proceed with next planned changes.`
-            });
-            this.messageBus.emit(`message:${this.name}`, {
-              from: 'system',
-              to: this.name,
-              content: 'Tool call completed. Continue building.',
-              autoRun: true,
-              deliverImmediately: true,
-              timestamp: new Date().toISOString()
-            });
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
+                role: 'system',
+                content: `${functionName} succeeded and file ${functionArgs.path} is successfully created. Proceed with next planned changes.`
+              });
+            } else if (functionName === 'read_file') {
+              const content = fileTools.readFile(functionArgs.path);
+              console.log(`📖 ${this.name.toUpperCase()} read file: ${functionArgs.path}`);
             
-          } else if (functionName === 'read_file') {
-            const content = fileTools.readFile(functionArgs.path);
-            console.log(`📖 ${this.name.toUpperCase()} read file: ${functionArgs.path}`);
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: content
+              });
+              processedToolCallIds.add(toolCallId);
             
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
-              content: content
-            });
-            
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'file:read',
               agent: this.name,
               path: functionArgs.path,
               timestamp: new Date().toISOString()
             });
 
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'tool:result',
               agent: this.name,
               tool: functionName,
@@ -929,36 +1110,31 @@ Try again with:
               timestamp: new Date().toISOString()
             });
 
-            this.conversationHistory.push({
-              role: 'system',
-              content: `${functionName} succeeded for file ${functionArgs.path}. Proceed with next planned changes.`
-            });
-            this.messageBus.emit(`message:${this.name}`, {
-              from: 'system',
-              to: this.name,
-              content: 'Tool call completed. Continue building.',
-              autoRun: true,
-              deliverImmediately: true,
-              timestamp: new Date().toISOString()
-            });
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
+                role: 'system',
+                content: `${functionName} succeeded for file ${functionArgs.path}. Proceed with next planned changes.`
+              });
+            } else if (functionName === 'str_replace') {
+              const result = fileTools.strReplace(this.name, functionArgs.path, functionArgs.old_string, functionArgs.new_string);
+              console.log(`✏️ ${this.name.toUpperCase()} modified file: ${functionArgs.path}`);
             
-          } else if (functionName === 'str_replace') {
-            const result = fileTools.strReplace(this.name, functionArgs.path, functionArgs.old_string, functionArgs.new_string);
-            console.log(`✏️ ${this.name.toUpperCase()} modified file: ${functionArgs.path}`);
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: result
+              });
+              processedToolCallIds.add(toolCallId);
             
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
-              content: result
-            });
-            
-            this.messageBus.emit('file:modified', {
+              this.messageBus.emit('file:modified', {
               agent: this.name,
               path: functionArgs.path,
               timestamp: new Date().toISOString()
             });
             
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'file:modified',
               agent: this.name,
               path: functionArgs.path,
@@ -966,7 +1142,7 @@ Try again with:
               timestamp: new Date().toISOString()
             });
 
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'tool:result',
               agent: this.name,
               tool: functionName,
@@ -974,30 +1150,23 @@ Try again with:
               timestamp: new Date().toISOString()
             });
 
-            this.conversationHistory.push({
-              role: 'system',
-              content: `${functionName} succeeded for file ${functionArgs.path}. Proceed with next planned changes.`
-            });
-            this.messageBus.emit(`message:${this.name}`, {
-              from: 'system',
-              to: this.name,
-              content: 'Tool call completed. Continue building.',
-              autoRun: true,
-              deliverImmediately: true,
-              timestamp: new Date().toISOString()
-            });
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
+                role: 'system',
+                content: `${functionName} succeeded for file ${functionArgs.path}. Proceed with next planned changes.`
+              });
+            } else if (functionName === 'list_files') {
+              const files = fileTools.listFiles(functionArgs.directory || '.');
+              console.log(`📂 ${this.name.toUpperCase()} listed files in: ${functionArgs.directory || '.'}`);
             
-          } else if (functionName === 'list_files') {
-            const files = fileTools.listFiles(functionArgs.directory || '.');
-            console.log(`📂 ${this.name.toUpperCase()} listed files in: ${functionArgs.directory || '.'}`);
-            
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
+              this.conversationHistory.push({
+              role: 'tool',
+              tool_call_id: toolCallId,
               content: JSON.stringify(files)
             });
+            processedToolCallIds.add(toolCallId);
             
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'file:list',
               agent: this.name,
               directory: functionArgs.directory || '.',
@@ -1005,7 +1174,7 @@ Try again with:
               timestamp: new Date().toISOString()
             });
 
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'tool:result',
               agent: this.name,
               tool: functionName,
@@ -1013,36 +1182,32 @@ Try again with:
               timestamp: new Date().toISOString()
             });
 
-            this.conversationHistory.push({
-              role: 'system',
-              content: `${functionName} succeeded for directory ${functionArgs.directory || '.'}. Proceed with next planned changes.`
-            });
-            this.messageBus.emit(`message:${this.name}`, {
-              from: 'system',
-              to: this.name,
-              content: 'Tool call completed. Continue building.',
-              autoRun: true,
-              deliverImmediately: true,
-              timestamp: new Date().toISOString()
-            });
-          } else if (functionName === 'delete_file') {
-            const result = fileTools.deleteFile(this.name, functionArgs.path);
-            console.log(`🗑️ ${this.name.toUpperCase()} deleted file: ${functionArgs.path}`);
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
+                role: 'system',
+                content: `${functionName} succeeded for directory ${functionArgs.directory || '.'}. Proceed with next planned changes.`
+              });
+            } else if (functionName === 'delete_file') {
+              const result = fileTools.deleteFile(this.name, functionArgs.path);
+              console.log(`🗑️ ${this.name.toUpperCase()} deleted file: ${functionArgs.path}`);
             
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
-              content: result
-            });
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: result
+              });
+              processedToolCallIds.add(toolCallId);
             
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'file:deleted',
               agent: this.name,
               path: functionArgs.path,
               timestamp: new Date().toISOString()
             });
 
-            this.messageBus.emit('ws:broadcast', this.conversationId, {
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
               type: 'tool:result',
               agent: this.name,
               tool: functionName,
@@ -1050,62 +1215,116 @@ Try again with:
               timestamp: new Date().toISOString()
             });
 
-            this.conversationHistory.push({
-              role: 'system',
-              content: `${functionName} succeeded and file ${functionArgs.path} is successfully deleted. Proceed with next planned changes.`
-            });
-            this.messageBus.emit(`message:${this.name}`, {
-              from: 'system',
-              to: this.name,
-              content: 'Tool call completed. Continue building.',
-              autoRun: true,
-              deliverImmediately: true,
-              timestamp: new Date().toISOString()
-            });
-          } else if (functionName === 'read_message') {
-            const delivery = this._readNextInboxMessage();
-            this.conversationHistory.push({
-              role: 'function',
-              name: functionName,
-              content: delivery.response
-            });
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
+                role: 'system',
+                content: `${functionName} succeeded and file ${functionArgs.path} is successfully deleted. Proceed with next planned changes.`
+              });
+            } else if (functionName === 'read_message') {
+              const delivery = this._readNextInboxMessage();
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: delivery.response
+              });
+              processedToolCallIds.add(toolCallId);
 
             if (delivery.messageRead) {
               this.needsAnotherRun = true;
-              this.conversationHistory.push({
+              // Defer system message - must add AFTER all tool responses
+              deferredSystemMessages.push({
                 role: 'system',
                 content: `${functionName} succeeded. ${this.inbox.length} message(s) left. Proceed with next planned changes.`
               });
-              this.messageBus.emit(`message:${this.name}`, {
-                from: 'system',
-                to: this.name,
-                content: 'Tool call completed. Continue building.',
-                autoRun: true,
-                deliverImmediately: true,
+            }
+            }
+          } catch (error) {
+              console.error(`⚠️  Error executing function ${functionName}: ${error.message}`);
+              
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCallId,
+                content: `ERROR: ${error.message}\n\nWhat went wrong: ${this._getErrorGuidance(functionName, error.message)}`
+              });
+              processedToolCallIds.add(toolCallId);
+              
+              // Emit error event to WebSocket
+              this.messageBus.emit('ws:broadcast', this.conversationId, {
+                type: 'tool:error',
+                agent: this.name,
+                tool: functionName,
+                error: error.message,
                 timestamp: new Date().toISOString()
               });
             }
           }
+        } finally {
+          // CRITICAL: Always verify all tool_call_ids have responses, even if exceptions occurred
+          // This ensures we never leave an assistant message with tool_calls without all responses
+          console.log(`🔍 [${this.name}] Safeguard: Checking ${responseMessage.tool_calls.length} tool calls, ${processedToolCallIds.size} processed`);
+          for (const toolCall of responseMessage.tool_calls) {
+            if (!processedToolCallIds.has(toolCall.id)) {
+              console.warn(`⚠️  [${this.name}] Missing response for tool_call_id ${toolCall.id}, adding error response`);
+              // CRITICAL: Insert tool response IMMEDIATELY after assistant message
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCall.id,
+                content: `ERROR: Tool call was not processed. This may be due to an internal error.`
+              });
+              processedToolCallIds.add(toolCall.id);
+            }
+          }
+          console.log(`✅ [${this.name}] Safeguard: All ${responseMessage.tool_calls.length} tool_call_ids now have responses`);
           
-        } catch (error) {
-          console.error(`⚠️  Error executing function ${functionName}: ${error.message}`);
+          // Verify responses are actually in conversation history
+          const toolResponseIds = new Set(
+            this.conversationHistory
+              .filter(m => m.role === 'tool' && m.tool_call_id)
+              .map(m => m.tool_call_id)
+          );
+          const missingInHistory = responseMessage.tool_calls.filter(tc => !toolResponseIds.has(tc.id));
+          if (missingInHistory.length > 0) {
+            console.error(`❌ [${this.name}] CRITICAL: Safeguard added responses but they're not in history! Missing: ${missingInHistory.map(tc => tc.id).join(', ')}`);
+            // Force add them again at the correct position
+            for (const toolCall of missingInHistory) {
+              const insertIndex = getToolResponseInsertionIndex();
+              this.conversationHistory.splice(insertIndex, 0, {
+                role: 'tool',
+                tool_call_id: toolCall.id,
+                content: `ERROR: Tool call was not processed. This may be due to an internal error.`
+              });
+            }
+          } else {
+            console.log(`✅ [${this.name}] Verified: All ${responseMessage.tool_calls.length} tool responses are in conversation history`);
+          }
           
-          // Add detailed error to conversation history so agent can adapt
-          this.conversationHistory.push({
-            role: 'function',
-            name: functionName,
-            content: `ERROR: ${error.message}\n\nWhat went wrong: ${this._getErrorGuidance(functionName, error.message)}`
-          });
-          
-          // Emit error event to WebSocket
-          this.messageBus.emit('ws:broadcast', this.conversationId, {
-            type: 'tool:error',
-            agent: this.name,
-            tool: functionName,
-            error: error.message,
-            timestamp: new Date().toISOString()
-          });
+          // CRITICAL: Add all deferred system messages AFTER all tool responses
+          // OpenAI requires tool responses to be consecutive immediately after assistant message
+          // Find insertion point after all tool responses
+          const systemMsgInsertIndex = getToolResponseInsertionIndex();
+          for (const systemMsg of deferredSystemMessages) {
+            this.conversationHistory.splice(systemMsgInsertIndex, 0, systemMsg);
+          }
+          if (deferredSystemMessages.length > 0) {
+            console.log(`✅ [${this.name}] Added ${deferredSystemMessages.length} deferred system message(s) after all tool responses`);
+          }
         }
+        
+        // After all tool calls are processed and verified, trigger next turn
+        // This ensures all tool responses are in history before the next API call
+        this.messageBus.emit(`message:${this.name}`, {
+          from: 'system',
+          to: this.name,
+          content: 'All tool calls completed. Continue building.',
+          autoRun: true,
+          deliverImmediately: true,
+          timestamp: new Date().toISOString()
+        });
       } else {
         // Agent responded with text but no function call
         this.textOnlyResponses++;
@@ -1506,6 +1725,39 @@ app.get('/health', (req, res) => {
   });
 });
 
+// API endpoint to list all files in workspace
+app.get('/api/files', (req, res) => {
+  try {
+    const files = fileTools.listFiles('.');
+    res.json({ files });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// API endpoint to read a file's content
+// Use a regex route to match /api/files/ followed by any path
+app.get(/^\/api\/files\/(.+)$/, (req, res) => {
+  try {
+    // Extract the file path from req.url
+    // req.url will be like '/api/files/backend/test.js' or '/api/files/backend/test.js?query=...'
+    const urlPath = req.url.split('?')[0]; // Remove query string
+    const match = urlPath.match(/^\/api\/files\/(.+)$/);
+    
+    if (!match || !match[1]) {
+      return res.status(400).json({ error: 'File path is required' });
+    }
+    
+    // Decode the file path (it comes URL encoded)
+    const decodedPath = decodeURIComponent(match[1]);
+    
+    const content = fileTools.readFile(decodedPath);
+    res.json({ path: decodedPath, content });
+  } catch (error) {
+    res.status(404).json({ error: error.message });
+  }
+});
+
 // Root endpoint - serve HTML client
 app.get('/', (req, res) => {
   // If Accept header includes text/html, serve the HTML client
@@ -1534,7 +1786,7 @@ app.get('/', (req, res) => {
         'Autonomous agents with Vercel AI SDK',
         'Pub/Sub architecture using EventEmitter',
         'Function calling with talk() function',
-        'Max 3 talk calls per agent',
+        'Max 30 talk calls per agent',
         'Agents decide when to complete'
       ],
       webClient: `Open http://localhost:${port} in your browser for the web interface`
