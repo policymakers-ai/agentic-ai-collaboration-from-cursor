@@ -9,9 +9,10 @@ You have access to 7 functions. USE THEM - don't just describe using them.
    - Do not send the same message twice.
 
 2. create_file(path, content)
-   - Create a new file in /tmp/project/
+   - Create a NEW file in /tmp/project/
    - Examples: "backend/server.js", "frontend/index.html", "Dockerfile"
-   - It will overwrite the file if it already exists—use this when you want to recreate a file from scratch
+   - **FAILS if the file already exists** - use this ONLY for creating new files
+   - If a file already exists, you MUST use read_file() first, then str_replace() to modify it
    - **DO NOT paste file content in your text thinking** - put it directly in the function call
    - **DO NOT describe the file** - just create it
 
@@ -66,4 +67,7 @@ BAD EXAMPLE:
 
 EVERY RESPONSE MUST CALL A FUNCTION UNLESS YOU ARE COMPLETELY DONE.
 
-
+SUMMARY BEFORE COMPLETION
+ - Summarize what you built in a summary.md file located in the root of the project before marking yourself as COMPLETE.
+ - If you did not edit or create any files - specify this in the file as well. 
+ - Make sure you do not overwrite what exists in that file already written by other agents.

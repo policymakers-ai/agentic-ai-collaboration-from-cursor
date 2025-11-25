@@ -93,6 +93,16 @@ class FileSystemTools {
   createFile(agentName, filePath, content) {
     const fullPath = this._validatePath(filePath);
 
+    // Check if file already exists
+    if (existsSync(fullPath)) {
+      throw new Error(
+        `File "${filePath}" already exists. To modify an existing file, you must:\n` +
+        `1. Use read_file("${filePath}") to read the current content\n` +
+        `2. Use str_replace("${filePath}", old_string, new_string) to make changes\n` +
+        `The create_file() function can only be used to create NEW files that don't exist yet.`
+      );
+    }
+
     // Check lock
     if (!this.lockManager.acquireLock(filePath, agentName)) {
       const owner = this.lockManager.getLockOwner(filePath);
